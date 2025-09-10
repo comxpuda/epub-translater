@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,7 +23,7 @@ import (
 	htmlpkg "golang.org/x/net/html"
 )
 
-var version = "0.4.0"
+var version = "0.5.0"
 
 // ===== CLI flags =====
 var (
@@ -36,7 +37,7 @@ var (
 	batchSize     = flag.Int("batch", 16, "Batch size (texts per request)")
 	temp          = flag.Float64("temp", 0.0, "Sampling temperature")
 	includeAlt    = flag.Bool("include-alt", false, "Also translate <img alt=...>")
-	timeoutSecs   = flag.Int("timeout", 100, "HTTP timeout in seconds")
+	timeoutSecs   = flag.Int("timeout", 150, "HTTP timeout in seconds")
 	workdir       = flag.String("workdir", "", "Working directory for resume/snapshots (default: .epubtrans/<stem>)")
 	resume        = flag.Bool("resume", false, "Resume from previous run using state in workdir")
 	snapshotEvery = flag.Int("snapshot-every", 5, "Write a partial EPUB snapshot every N finished HTML files (0=off)")
@@ -74,9 +75,15 @@ func pct(a, b int) float64 {
 	}
 	return (float64(a) * 100) / float64(b)
 }
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
 
 // ===== LLM client =====
-const systemPrompt = "You are a professional literary translator. Translate the given items into the target language while preserving meaning, tone, and inline punctuation. For learning, if target language is Japanese, keep difficulty around JLPT N2 to early N1. If there are people's names, keep the original (do not translate). Output ONLY a JSON array of strings in the same order; no commentary. Return strictly JSON like: [\"訳文1\", \"訳文2\"]."
+const systemPrompt = "You are a professional literary translator. Translate the given items into the target language while preserving meaning, tone, and inline punctuation. For learning, if target language is Japanese, keep difficulty around JLPT N2 to N1 level. If there are people's names, keep the original (do not translate). Output ONLY a JSON array of strings in the same order; no commentary. Return strictly JSON like: [\"訳文1\", \"訳文2\"]."
 
 func userPrompt(src, tgt string, items []string) string {
 	itemsJSON, _ := json.Marshal(items)
@@ -104,6 +111,7 @@ type chatResponse struct {
 }
 
 // translateBatch calls an OpenAI-compatible /chat/completions endpoint.
+// Rebuilds the request each attempt; retries 408/429/5xx with exponential backoff and visible logs.
 func translateBatch(httpc *http.Client, items []string) ([]string, error) {
 	payload := chatRequest{
 		Model:       *model,
@@ -114,83 +122,99 @@ func translateBatch(httpc *http.Client, items []string) ([]string, error) {
 		},
 	}
 	buf, _ := json.Marshal(payload)
-
 	url := strings.TrimRight(*baseURL, "/") + "/chat/completions"
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(buf))
-	req.Header.Set("Content-Type", "application/json")
-	if ak := strings.TrimSpace(*apiKey); ak != "" {
-		req.Header.Set("Authorization", "Bearer "+ak)
-	}
 
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		// allow cancellation when Ctrl-C arrives
+		if attempt > 1 {
+			wait := time.Duration(1<<uint(min(attempt-1, 4))) * time.Second
+			fmt.Fprintf(os.Stderr, "[info] retry %d in %v\n", attempt, wait)
+			time.Sleep(wait)
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeoutSecs)*time.Second)
-		req = req.WithContext(ctx)
+		req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(buf))
+		req.Header.Set("Content-Type", "application/json")
+		if ak := strings.TrimSpace(*apiKey); ak != "" {
+			req.Header.Set("Authorization", "Bearer "+ak)
+		}
 
 		resp, err := httpc.Do(req)
 		if err != nil {
+			cancel()
+			// retry on timeout
+			if errors.Is(err, context.DeadlineExceeded) {
+				lastErr = fmt.Errorf("deadline exceeded: %w", err)
+				continue
+			}
+			var nerr net.Error
+			if errors.As(err, &nerr) && nerr.Timeout() {
+				lastErr = fmt.Errorf("timeout: %w", err)
+				continue
+			}
 			lastErr = err
-			cancel()
-		} else {
-			b, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			cancel()
+			continue
+		}
 
-			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-				lastErr = fmt.Errorf("server error %d: %s", resp.StatusCode, string(b))
-			} else if resp.StatusCode >= 300 {
-				return nil, fmt.Errorf("http %d: %s", resp.StatusCode, string(b))
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		cancel()
+
+		status := resp.StatusCode
+		if status == 408 || status == 429 || (status >= 500 && status <= 599) {
+			lastErr = fmt.Errorf("retryable http %d: %s", status, truncate(string(b), 512))
+			continue
+		}
+		if status >= 300 {
+			return nil, fmt.Errorf("http %d: %s", status, truncate(string(b), 512))
+		}
+
+		var cr chatResponse
+		if err := json.Unmarshal(b, &cr); err != nil {
+			return nil, fmt.Errorf("bad json: %w", err)
+		}
+		if len(cr.Choices) == 0 {
+			return nil, errors.New("no choices from LLM")
+		}
+		content := strings.TrimSpace(cr.Choices[0].Message.Content)
+
+		// strip <think>...</think>
+		for {
+			start := strings.Index(content, "<think>")
+			end := strings.Index(content, "</think>")
+			if start != -1 && end != -1 && end > start {
+				content = content[:start] + content[end+len("</think>"):]
 			} else {
-				var cr chatResponse
-				if err := json.Unmarshal(b, &cr); err != nil {
-					return nil, fmt.Errorf("bad json: %w", err)
-				}
-				if len(cr.Choices) == 0 {
-					return nil, errors.New("no choices from LLM")
-				}
-				content := strings.TrimSpace(cr.Choices[0].Message.Content)
-				// strip <think>...</think> if present
-				for {
-					start := strings.Index(content, "<think>")
-					end := strings.Index(content, "</think>")
-					if start != -1 && end != -1 && end > start {
-						content = content[:start] + content[end+len("</think>"):]
-					} else {
-						break
-					}
-				}
-				content = strings.TrimSpace(content)
-
-				var out []string
-				if err := json.Unmarshal([]byte(content), &out); err != nil {
-					// try to salvage a JSON array
-					start := strings.Index(content, "[")
-					end := strings.LastIndex(content, "]")
-					if start != -1 && end != -1 && end > start {
-						arr := content[start : end+1]
-						if err2 := json.Unmarshal([]byte(arr), &out); err2 != nil {
-							trimmed := strings.Trim(arr, "[]\"")
-							if strings.Contains(trimmed, "\n") {
-								out = strings.Split(trimmed, "\n")
-							} else {
-								out = []string{trimmed}
-							}
-						}
-					} else {
-						trimmed := strings.Trim(content, "[]\"")
-						if strings.Contains(trimmed, "\n") {
-							out = strings.Split(trimmed, "\n")
-						} else {
-							out = []string{trimmed}
-						}
-					}
-				}
-				return out, nil
+				break
 			}
 		}
-		// exponential backoff: 1,2,4,8,16 seconds
-		time.Sleep(time.Duration(1<<uint(min(attempt-1, 4))) * time.Second)
+		content = strings.TrimSpace(content)
+
+		var out []string
+		if err := json.Unmarshal([]byte(content), &out); err != nil {
+			// try to salvage a JSON array
+			start := strings.Index(content, "[")
+			end := strings.LastIndex(content, "]")
+			if start != -1 && end != -1 && end > start {
+				arr := content[start : end+1]
+				if err2 := json.Unmarshal([]byte(arr), &out); err2 != nil {
+					trimmed := strings.Trim(arr, "[]\"")
+					if strings.Contains(trimmed, "\n") {
+						out = strings.Split(trimmed, "\n")
+					} else {
+						out = []string{trimmed}
+					}
+				}
+			} else {
+				trimmed := strings.Trim(content, "[]\"")
+				if strings.Contains(trimmed, "\n") {
+					out = strings.Split(trimmed, "\n")
+				} else {
+					out = []string{trimmed}
+				}
+			}
+		}
+		return out, nil
 	}
 	return nil, lastErr
 }
@@ -274,11 +298,11 @@ type stateFile struct {
 	To         string         `json:"to"`
 	IncludeAlt bool           `json:"include_alt"`
 	Batch      int            `json:"batch"`
-	HTMLFiles  []string       `json:"html_files"` // deterministic order
-	Offsets    map[string]int `json:"offsets"`    // per-file segment index already processed
-	Totals     map[string]int `json:"totals"`     // per-file total segments
+	HTMLFiles  []string       `json:"html_files"`
+	Offsets    map[string]int `json:"offsets"`
+	Totals     map[string]int `json:"totals"`
 	TotalAll   int            `json:"total_all"`
-	DoneAll    int            `json:"done_all"` // total translated segments
+	DoneAll    int            `json:"done_all"`
 	FailedAll  int            `json:"failed_all"`
 	StartedAt  time.Time      `json:"started_at"`
 	UpdatedAt  time.Time      `json:"updated_at"`
@@ -300,7 +324,6 @@ func copyEPUBToWorkdir(r *zip.ReadCloser, wd string) error {
 			fmt.Fprintln(os.Stderr, "[warn] EPUB has invalid META-INF as file, ignoring")
 			continue
 		}
-
 		// Directory entry?
 		if strings.HasSuffix(f.Name, "/") {
 			if err := os.MkdirAll(dst, 0755); err != nil {
@@ -308,7 +331,6 @@ func copyEPUBToWorkdir(r *zip.ReadCloser, wd string) error {
 			}
 			continue
 		}
-
 		// Ensure parent dirs exist
 		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 			return fmt.Errorf("mkdir: %w", err)
@@ -496,14 +518,12 @@ func main() {
 
 	// Prepare workdir contents (idempotent)
 	if !*resume {
-		// fresh copy
 		if err := copyEPUBToWorkdir(r, wd); err != nil {
 			log.Fatalf("prime workdir: %v", err)
 		}
 	} else {
-		// ensure workdir at least exists; if empty, seed it
 		empty := true
-		filepath.Walk(wd, func(_ string, info os.FileInfo, _ error) error {
+		_ = filepath.Walk(wd, func(_ string, info os.FileInfo, _ error) error {
 			if info != nil && !info.IsDir() {
 				empty = false
 			}
@@ -539,16 +559,19 @@ func main() {
 	if *resume {
 		if b, err := os.ReadFile(statePath); err == nil {
 			_ = json.Unmarshal(b, st)
+			// warn on parameter mismatch to avoid confusing resumes
+			if st.InputEPUB != *inPath || st.Model != *model || st.BaseURL != *baseURL ||
+				st.To != *tgtLang || st.From != *srcLang || st.IncludeAlt != *includeAlt {
+				fmt.Fprintf(os.Stderr, "[warn] resume parameters differ from saved state (input/model/base/from/to/includeAlt). Consider restarting without -resume or repeat previous flags.\n")
+			}
 		}
 	}
-	// ensure fields exist even after old state schema
 	if st.Offsets == nil {
 		st.Offsets = map[string]int{}
 	}
 	if st.Totals == nil {
 		st.Totals = totals
 	}
-
 	_ = st.save(statePath)
 
 	// Graceful Ctrl-C: snapshot & save state
@@ -558,14 +581,16 @@ func main() {
 		<-stop
 		fmt.Println("\nSignal caught → snapshot & save state …")
 		_ = st.save(statePath)
-		if err := makeEPUBFromDir(wd, out+".partial.epub"); err != nil {
+		partial := fmt.Sprintf("%s.partial.%s.epub", out, time.Now().Format("20060102-150405"))
+		if err := makeEPUBFromDir(wd, partial); err != nil {
 			fmt.Fprintf(os.Stderr, "[warn] snapshot error: %v\n", err)
+		} else {
+			fmt.Printf("[intermediate] Saved partial EPUB: %s\n", partial)
 		}
 		os.Exit(130)
 	}()
 
 	httpc := &http.Client{Timeout: time.Duration(*timeoutSecs) * time.Second}
-
 	translatedFiles := 0
 
 	// Translate each HTML in deterministic order
@@ -584,12 +609,12 @@ func main() {
 
 		targets := collectTextTargets(doc, st.IncludeAlt)
 		fileTotal := len(targets)
-		startOff := st.Offsets[name] // resume inside file
-		if startOff > fileTotal {
-			startOff = fileTotal
+		off := st.Offsets[name]
+		if off > fileTotal {
+			off = fileTotal
 		}
 
-		for off := startOff; off < fileTotal; off += st.Batch {
+		for off < fileTotal {
 			end := min(off+st.Batch, fileTotal)
 
 			// Gather batch texts
@@ -599,55 +624,70 @@ func main() {
 			}
 
 			outTexts, err := translateBatch(httpc, batch)
+			applied := 0
 			if err != nil {
-				// continue; leave originals; count failures
+				// continue; leave originals; count failures; skip this window
 				st.FailedAll += (end - off)
 				fmt.Fprintf(os.Stderr, "[warn] translate batch failed at %s [%d:%d): %v\n", name, off, end, err)
+				off = end
 			} else {
 				n := min(len(outTexts), end-off)
 				for j := 0; j < n; j++ {
+					txt := strings.TrimSpace(outTexts[j])
+					if txt == "" {
+						// don't apply empty salvage; count as failed
+						st.FailedAll++
+						continue
+					}
 					targets[off+j].Set(outTexts[j])
 					st.DoneAll++
+					applied++
 				}
 				if n < (end - off) {
 					miss := (end - off) - n
 					st.FailedAll += miss
 					fmt.Fprintf(os.Stderr, "[warn] model returned %d/%d items at %s [%d:%d)\n", n, end-off, name, off, end)
 				}
+				// If nothing applied, avoid infinite loop by skipping this window
+				if applied == 0 {
+					off = end
+				} else {
+					off += applied // retry remainder next iteration
+				}
 			}
 
-			// Update per-file offset & persist state
-			st.Offsets[name] = end
+			// Flush HTML to disk after each batch
+			var buf bytes.Buffer
+			if err := htmlpkg.Render(&buf, doc); err != nil {
+				fmt.Fprintf(os.Stderr, "[warn] render failed for %s batch up to %d: %v (keeping previous)\n", name, off, err)
+			} else {
+				if err := os.MkdirAll(filepath.Dir(inp), 0755); err != nil {
+					log.Fatalf("mkdir: %v", err)
+				}
+				if err := os.WriteFile(inp, buf.Bytes(), 0644); err != nil {
+					log.Fatalf("write translated: %v", err)
+				}
+			}
+
+			// Update per-file offset & persist state AFTER successful flush
+			st.Offsets[name] = off
 			_ = st.save(statePath)
 
 			if !*quiet {
 				fmt.Printf("[%s] %d/%d (%.1f%%), overall: %d/%d (%.1f%%)\n",
-					name, end, fileTotal, pct(end, fileTotal),
+					name, off, fileTotal, pct(off, fileTotal),
 					st.DoneAll, st.TotalAll, pct(st.DoneAll, max(1, st.TotalAll)))
 			}
-
-			time.Sleep(150 * time.Millisecond)
-		}
-
-		// Write translated HTML back
-		var buf bytes.Buffer
-		if err := htmlpkg.Render(&buf, doc); err != nil {
-			fmt.Fprintf(os.Stderr, "[warn] render failed for %s: %v (keeping original)\n", name, err)
-		} else {
-			if err := os.MkdirAll(filepath.Dir(inp), 0755); err != nil {
-				log.Fatalf("mkdir: %v", err)
-			}
-			if err := os.WriteFile(inp, buf.Bytes(), 0644); err != nil {
-				log.Fatalf("write translated: %v", err)
-			}
+			time.Sleep(120 * time.Millisecond)
 		}
 
 		translatedFiles++
 		// Periodic snapshot
 		if *snapshotEvery > 0 && translatedFiles%*snapshotEvery == 0 {
-			if err := makeEPUBFromDir(wd, out+".partial.epub"); err == nil {
+			partial := fmt.Sprintf("%s.partial.%s.epub", out, time.Now().Format("20060102-150405"))
+			if err := makeEPUBFromDir(wd, partial); err == nil {
 				if !*quiet {
-					fmt.Printf("[intermediate] Saved partial EPUB: %s\n", out+".partial.epub")
+					fmt.Printf("[intermediate] Saved partial EPUB: %s\n", partial)
 				}
 			} else {
 				fmt.Fprintf(os.Stderr, "[warn] failed to write partial EPUB: %v\n", err)
@@ -659,6 +699,6 @@ func main() {
 	if err := makeEPUBFromDir(wd, out); err != nil {
 		log.Fatalf("final EPUB: %v", err)
 	}
-	fmt.Printf("Done. Translated %d segments, %d failed.\n", st.DoneAll, st.FailedAll)
+	fmt.Printf("Done. Translated %d segments, %d failed (see stderr warnings for details).\n", st.DoneAll, st.FailedAll)
 	fmt.Printf("Output saved to: %s\n", out)
 }

@@ -1,2 +1,3 @@
 .epubtrans*
 epub-translator-cli
+*.epub
